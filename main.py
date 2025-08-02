@@ -32,7 +32,7 @@ def calcular_prato(payload: CalculoRequest):
     kcal = np.array([i.kcal / 100 for i in ingredientes])
     ref_pesos = np.array([i.peso_referencia or 100 for i in ingredientes])
 
-    # Objetivo: penalizar desvio de proporção; maximizar volume se sinalizado
+    # Função objetivo: penaliza proporção fora do habitual, pouco uso de ingrediente e favorece volume se solicitado
     def objetivo(x):
         prop_penalty = 0
         for i in range(n):
@@ -40,15 +40,13 @@ def calcular_prato(payload: CalculoRequest):
                 r_ideal = ref_pesos[i] / ref_pesos[j]
                 r_real = (x[i] + 1e-6) / (x[j] + 1e-6)
                 desv = (r_real - r_ideal) / r_ideal
-                if abs(desv) > 0.2:  # mais de 20% fora
+                if abs(desv) > 0.2:
                     prop_penalty += desv**2
-        # Penalidade por usar pouco de algum ingrediente
         uso_penalty = 0
         for i, ingr in enumerate(ingredientes):
             min_uso = 5 if ingr.gordura > 90 else 30
             if x[i] < min_uso:
                 uso_penalty += ((min_uso - x[i]) / min_uso) ** 2
-        # Penalidade por volume baixo (se maximizar_volume)
         volume_penalty = -np.sum(x) / 1000 if maximizar_volume else 0
         return prop_penalty + 0.2 * uso_penalty + volume_penalty
 
@@ -62,12 +60,12 @@ def calcular_prato(payload: CalculoRequest):
         # Proteína ±5%
         {"type": "ineq", "fun": lambda x: np.dot(proteina, x) - metas['proteina'] * 0.95},
         {"type": "ineq", "fun": lambda x: metas['proteina'] * 1.05 - np.dot(proteina, x)},
-        # Carbo ±10%
+        # Carboidrato: -10% até +20%
         {"type": "ineq", "fun": lambda x: np.dot(carbo, x) - metas['carbo'] * 0.90},
-        {"type": "ineq", "fun": lambda x: metas['carbo'] * 1.10 - np.dot(carbo, x)},
-        # Gordura ±10%
-        {"type": "ineq", "fun": lambda x: np.dot(gordura, x) - metas['gordura'] * 0.90},
-        {"type": "ineq", "fun": lambda x: metas['gordura'] * 1.10 - np.dot(gordura, x)},
+        {"type": "ineq", "fun": lambda x: metas['carbo'] * 1.20 - np.dot(carbo, x)},
+        # Gordura: -50% até a meta (nunca acima)
+        {"type": "ineq", "fun": lambda x: np.dot(gordura, x) - metas['gordura'] * 0.50},
+        {"type": "ineq", "fun": lambda x: metas['gordura'] - np.dot(gordura, x)},
         # Calorias ±2%
         {"type": "ineq", "fun": lambda x: np.dot(kcal, x) - metas['kcal'] * 0.98},
         {"type": "ineq", "fun": lambda x: metas['kcal'] * 1.02 - np.dot(kcal, x)},
@@ -77,7 +75,7 @@ def calcular_prato(payload: CalculoRequest):
 
     if res.success:
         porcoes = [
-            {"ingrediente": i.nome, "gramas": round(q, 1)}
+            {"ingrediente": i.nome, "gramas": max(0, int(round(q)))}
             for i, q in zip(ingredientes, res.x)
         ]
         return {
@@ -85,7 +83,35 @@ def calcular_prato(payload: CalculoRequest):
             "porcoes_calculadas": porcoes
         }
     else:
+        # Diagnóstico inteligente: verifica quais macros ficaram fora da faixa
+        tentativa = res.x if res.x is not None else x0
+        prot = np.dot(proteina, tentativa)
+        carb = np.dot(carbo, tentativa)
+        gord = np.dot(gordura, tentativa)
+        kc = np.dot(kcal, tentativa)
+        problemas = []
+        # Proteína
+        if prot < metas['proteina'] * 0.95:
+            problemas.append("proteína baixa")
+        if prot > metas['proteina'] * 1.05:
+            problemas.append("proteína alta")
+        # Carbo
+        if carb < metas['carbo'] * 0.90:
+            problemas.append("carboidrato baixo")
+        if carb > metas['carbo'] * 1.20:
+            problemas.append("carboidrato alto")
+        # Gordura
+        if gord < metas['gordura'] * 0.50:
+            problemas.append("gordura baixa")
+        if gord > metas['gordura']:
+            problemas.append("gordura alta")
+        # Kcal
+        if kc < metas['kcal'] * 0.98:
+            problemas.append("calorias baixas")
+        if kc > metas['kcal'] * 1.02:
+            problemas.append("calorias altas")
         return {
             "sucesso": False,
-            "erro": "Não foi possível calcular uma combinação viável dentro das restrições."
+            "erro": "Não foi possível calcular uma combinação viável dentro das restrições.",
+            "diagnostico": problemas
         }
